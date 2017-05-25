@@ -13,6 +13,7 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/common/log"
 	"strconv"
+	"sync"
 )
 
 var (
@@ -29,19 +30,46 @@ const (
 	exporter  = "exporter"
 )
 
+// DBConn persistent connect to DB
+type DBConn struct {
+	db  *sql.DB
+	dsn string
+}
+
+func NewDBConn(dsn string) *DBConn {
+	db, err := sql.Open("oci8", dsn)
+	if err != nil {
+		return nil
+	}
+	return &DBConn{db: db, dsn: dsn}
+}
+
+func (d *DBConn) GetConnect() (*sql.DB, error) {
+	if d.db != nil {
+		return d.db, nil
+	}
+	db, err := sql.Open("oci8", d.dsn)
+	if err != nil {
+		return nil, err
+	}
+	d.db = db
+	return d.db, nil
+}
+
 // Exporter collects Oracle DB metrics. It implements prometheus.Collector.
 type Exporter struct {
-	dsn             string
+	//	dsn             string
 	duration, error prometheus.Gauge
 	totalScrapes    prometheus.Counter
 	scrapeErrors    *prometheus.CounterVec
 	up              prometheus.Gauge
+	db              *DBConn
 }
 
 // NewExporter returns a new Oracle DB exporter for the provided DSN.
 func NewExporter(dsn string) *Exporter {
 	return &Exporter{
-		dsn: dsn,
+		db: NewDBConn(dsn),
 		duration: prometheus.NewGauge(prometheus.GaugeOpts{
 			Namespace: namespace,
 			Subsystem: exporter,
@@ -125,12 +153,11 @@ func (e *Exporter) scrape(ch chan<- prometheus.Metric) {
 		}
 	}(time.Now())
 
-	db, err := sql.Open("oci8", e.dsn)
+	db, err := e.db.GetConnect()
 	if err != nil {
 		log.Errorln("Error opening connection to database:", err)
 		return
 	}
-	defer db.Close()
 
 	isUpRows, err := db.Query("SELECT 1 FROM DUAL")
 	if err != nil {
@@ -141,30 +168,53 @@ func (e *Exporter) scrape(ch chan<- prometheus.Metric) {
 	isUpRows.Close()
 	e.up.Set(1)
 
-	if err = ScrapeActivity(db, ch); err != nil {
-		log.Errorln("Error scraping for activity:", err)
-		e.scrapeErrors.WithLabelValues("activity").Inc()
-	}
+	wg := sync.WaitGroup{}
 
-	if err = ScrapeWaitTime(db, ch); err != nil {
-		log.Errorln("Error scraping for wait_time:", err)
-		e.scrapeErrors.WithLabelValues("wait_time").Inc()
-	}
+	wg.Add(1)
+	go func() {
+		if err = ScrapeActivity(db, ch); err != nil {
+			log.Errorln("Error scraping for activity:", err)
+			e.scrapeErrors.WithLabelValues("activity").Inc()
+		}
+		wg.Done()
+	}()
 
-	if err = ScrapeSessions(db, ch); err != nil {
-		log.Errorln("Error scraping for sessions:", err)
-		e.scrapeErrors.WithLabelValues("sessions").Inc()
-	}
+	wg.Add(1)
+	go func() {
+		if err = ScrapeWaitTime(db, ch); err != nil {
+			log.Errorln("Error scraping for wait_time:", err)
+			e.scrapeErrors.WithLabelValues("wait_time").Inc()
+		}
+		wg.Done()
+	}()
 
-	if err = ScrapeAQ(db, ch); err != nil {
-		log.Errorln("Error scraping for Oracle AQ:", err)
-		e.scrapeErrors.WithLabelValues("oracleaq").Inc()
-	}
+	wg.Add(1)
+	go func() {
+		if err = ScrapeSessions(db, ch); err != nil {
+			log.Errorln("Error scraping for sessions:", err)
+			e.scrapeErrors.WithLabelValues("sessions").Inc()
+		}
+		wg.Done()
+	}()
 
-	if err = ScrapeASM(db, ch); err != nil {
-		log.Errorln("Error scraping for Oracle ASM iostat:", err)
-		e.scrapeErrors.WithLabelValues("oracleasm").Inc()
-	}
+	wg.Add(1)
+	go func() {
+		if err = ScrapeAQ(db, ch); err != nil {
+			log.Errorln("Error scraping for Oracle AQ:", err)
+			e.scrapeErrors.WithLabelValues("oracleaq").Inc()
+		}
+		wg.Done()
+	}()
+
+	wg.Add(1)
+	go func() {
+		if err = ScrapeASM(db, ch); err != nil {
+			log.Errorln("Error scraping for Oracle ASM iostat:", err)
+			e.scrapeErrors.WithLabelValues("oracleasm").Inc()
+		}
+		wg.Done()
+	}()
+	wg.Wait()
 }
 
 // ScrapeSessions collects session metrics from the v$session view.
@@ -323,93 +373,146 @@ func ScrapeASM(db *sql.DB, ch chan<- prometheus.Metric) error {
 		rows *sql.Rows
 		err  error
 	)
-	rows, err = db.Query("SELECT instname, dbname, group_number, disk_number, failgroup, reads, writes, read_errs, write_errs, read_time, write_time, bytes_read, bytes_written, hot_reads, hot_writes, hot_bytes_read, hot_bytes_written, cold_reads, cold_writes, cold_bytes_read, cold_bytes_written")
+	rows, err = db.Query("SELECT instname, dbname, group_number, disk_number, failgroup, reads, writes, read_errs, write_errs, read_time, write_time, bytes_read, bytes_written, hot_reads, hot_writes, hot_bytes_read, hot_bytes_written, cold_reads, cold_writes, cold_bytes_read, cold_bytes_written FROM v$asm_disk_iostat")
 	if err != nil {
 		return err
 	}
 	for rows.Next() {
-		var instname, dbname, group_number_str, disk_number_str, failgroup_str string
-		var group_number, disk_number, failgroup, reads, writes, read_errs, write_errs, read_time, write_time, bytes_read, bytes_written, hot_reads, hot_writes, hot_bytes_read, hot_bytes_written, cold_reads, cold_writes, cold_bytes_read, cold_bytes_written float64
+		var instname, dbname, group_number_str, disk_number_str, failgroup string
+		var group_number, disk_number, reads, writes, read_errs, write_errs, read_time, write_time, bytes_read, bytes_written, hot_reads, hot_writes, hot_bytes_read, hot_bytes_written, cold_reads, cold_writes, cold_bytes_read, cold_bytes_written float64
+
+		if err = rows.Scan(&instname, &dbname, &group_number, &disk_number, &failgroup, &reads, &writes, &read_errs, &write_errs,
+			&read_time, &write_time, &bytes_read, &bytes_written, &hot_reads, &hot_writes, &hot_bytes_read, &hot_bytes_written,
+			&cold_reads, &cold_writes, &cold_bytes_read, &cold_bytes_written); err != nil {
+			return err
+		}
 		group_number_str = strconv.FormatFloat(group_number, 'f', -1, 64)
 		disk_number_str = strconv.FormatFloat(disk_number, 'f', -1, 64)
-		failgroup_str = strconv.FormatFloat(failgroup, 'f', -1, 64)
 		ch <- prometheus.MustNewConstMetric(
-			prometheus.NewDesc(prometheus.BuildFQName("oracle", "asm", "count"), "Generic counter metric from v$asm_disk_iostat view in Oracle", []string{}, prometheus.Labels{"method": "reads", "instname": instname, "dbname": dbname, "group_number": group_number_str, "disk_number": disk_number_str, "failgroup": failgroup_str}),
+			prometheus.NewDesc(prometheus.BuildFQName("oracle", "asm", "count"),
+				"Generic counter metric from v$asm_disk_iostat view in Oracle",
+				[]string{},
+				prometheus.Labels{"method": "reads", "instname": instname, "dbname": dbname, "group_number": group_number_str, "disk_number": disk_number_str, "failgroup": failgroup}),
 			prometheus.CounterValue,
 			reads,
 		)
 		ch <- prometheus.MustNewConstMetric(
-			prometheus.NewDesc(prometheus.BuildFQName("oracle", "asm", "count"), "Generic counter metric from v$asm_disk_iostat view in Oracle", []string{}, prometheus.Labels{"method": "reads", "instname": instname, "dbname": dbname, "group_number": group_number_str, "disk_number": disk_number_str, "failgroup": failgroup_str}),
+			prometheus.NewDesc(prometheus.BuildFQName("oracle", "asm", "count"),
+				"Generic counter metric from v$asm_disk_iostat view in Oracle",
+				[]string{},
+				prometheus.Labels{"method": "writes", "instname": instname, "dbname": dbname, "group_number": group_number_str, "disk_number": disk_number_str, "failgroup": failgroup}),
 			prometheus.CounterValue,
 			writes,
 		)
 		ch <- prometheus.MustNewConstMetric(
-			prometheus.NewDesc(prometheus.BuildFQName("oracle", "asm", "count"), "Generic counter metric from v$asm_disk_iostat view in Oracle", []string{}, prometheus.Labels{"method": "reads", "instname": instname, "dbname": dbname, "group_number": group_number_str, "disk_number": disk_number_str, "failgroup": failgroup_str}),
+			prometheus.NewDesc(prometheus.BuildFQName("oracle", "asm", "count"),
+				"Generic counter metric from v$asm_disk_iostat view in Oracle",
+				[]string{},
+				prometheus.Labels{"method": "read_errs", "instname": instname, "dbname": dbname, "group_number": group_number_str, "disk_number": disk_number_str, "failgroup": failgroup}),
 			prometheus.CounterValue,
 			read_errs,
 		)
 		ch <- prometheus.MustNewConstMetric(
-			prometheus.NewDesc(prometheus.BuildFQName("oracle", "asm", "count"), "Generic counter metric from v$asm_disk_iostat view in Oracle", []string{}, prometheus.Labels{"method": "reads", "instname": instname, "dbname": dbname, "group_number": group_number_str, "disk_number": disk_number_str, "failgroup": failgroup_str}),
+			prometheus.NewDesc(prometheus.BuildFQName("oracle", "asm", "count"),
+				"Generic counter metric from v$asm_disk_iostat view in Oracle",
+				[]string{},
+				prometheus.Labels{"method": "write_errs", "instname": instname, "dbname": dbname, "group_number": group_number_str, "disk_number": disk_number_str, "failgroup": failgroup}),
 			prometheus.CounterValue,
 			write_errs,
 		)
 		ch <- prometheus.MustNewConstMetric(
-			prometheus.NewDesc(prometheus.BuildFQName("oracle", "asm", "count"), "Generic counter metric from v$asm_disk_iostat view in Oracle", []string{}, prometheus.Labels{"method": "reads", "instname": instname, "dbname": dbname, "group_number": group_number_str, "disk_number": disk_number_str, "failgroup": failgroup_str}),
+			prometheus.NewDesc(prometheus.BuildFQName("oracle", "asm", "count"),
+				"Generic counter metric from v$asm_disk_iostat view in Oracle",
+				[]string{},
+				prometheus.Labels{"method": "read_time", "instname": instname, "dbname": dbname, "group_number": group_number_str, "disk_number": disk_number_str, "failgroup": failgroup}),
 			prometheus.CounterValue,
 			read_time,
 		)
 		ch <- prometheus.MustNewConstMetric(
-			prometheus.NewDesc(prometheus.BuildFQName("oracle", "asm", "count"), "Generic counter metric from v$asm_disk_iostat view in Oracle", []string{}, prometheus.Labels{"method": "reads", "instname": instname, "dbname": dbname, "group_number": group_number_str, "disk_number": disk_number_str, "failgroup": failgroup_str}),
+			prometheus.NewDesc(prometheus.BuildFQName("oracle", "asm", "count"),
+				"Generic counter metric from v$asm_disk_iostat view in Oracle",
+				[]string{},
+				prometheus.Labels{"method": "write_time", "instname": instname, "dbname": dbname, "group_number": group_number_str, "disk_number": disk_number_str, "failgroup": failgroup}),
 			prometheus.CounterValue,
 			write_time,
 		)
 		ch <- prometheus.MustNewConstMetric(
-			prometheus.NewDesc(prometheus.BuildFQName("oracle", "asm", "count"), "Generic counter metric from v$asm_disk_iostat view in Oracle", []string{}, prometheus.Labels{"method": "reads", "instname": instname, "dbname": dbname, "group_number": group_number_str, "disk_number": disk_number_str, "failgroup": failgroup_str}),
+			prometheus.NewDesc(prometheus.BuildFQName("oracle", "asm", "count"),
+				"Generic counter metric from v$asm_disk_iostat view in Oracle",
+				[]string{},
+				prometheus.Labels{"method": "bytes_read", "instname": instname, "dbname": dbname, "group_number": group_number_str, "disk_number": disk_number_str, "failgroup": failgroup}),
 			prometheus.CounterValue,
 			bytes_read,
 		)
 		ch <- prometheus.MustNewConstMetric(
-			prometheus.NewDesc(prometheus.BuildFQName("oracle", "asm", "count"), "Generic counter metric from v$asm_disk_iostat view in Oracle", []string{}, prometheus.Labels{"method": "reads", "instname": instname, "dbname": dbname, "group_number": group_number_str, "disk_number": disk_number_str, "failgroup": failgroup_str}),
+			prometheus.NewDesc(prometheus.BuildFQName("oracle", "asm", "count"),
+				"Generic counter metric from v$asm_disk_iostat view in Oracle",
+				[]string{},
+				prometheus.Labels{"method": "bytes_written", "instname": instname, "dbname": dbname, "group_number": group_number_str, "disk_number": disk_number_str, "failgroup": failgroup}),
 			prometheus.CounterValue,
 			bytes_written,
 		)
 		ch <- prometheus.MustNewConstMetric(
-			prometheus.NewDesc(prometheus.BuildFQName("oracle", "asm", "count"), "Generic counter metric from v$asm_disk_iostat view in Oracle", []string{}, prometheus.Labels{"method": "reads", "instname": instname, "dbname": dbname, "group_number": group_number_str, "disk_number": disk_number_str, "failgroup": failgroup_str}),
+			prometheus.NewDesc(prometheus.BuildFQName("oracle", "asm", "count"),
+				"Generic counter metric from v$asm_disk_iostat view in Oracle",
+				[]string{},
+				prometheus.Labels{"method": "hot_reads", "instname": instname, "dbname": dbname, "group_number": group_number_str, "disk_number": disk_number_str, "failgroup": failgroup}),
 			prometheus.CounterValue,
 			hot_reads,
 		)
 		ch <- prometheus.MustNewConstMetric(
-			prometheus.NewDesc(prometheus.BuildFQName("oracle", "asm", "count"), "Generic counter metric from v$asm_disk_iostat view in Oracle", []string{}, prometheus.Labels{"method": "reads", "instname": instname, "dbname": dbname, "group_number": group_number_str, "disk_number": disk_number_str, "failgroup": failgroup_str}),
+			prometheus.NewDesc(prometheus.BuildFQName("oracle", "asm", "count"),
+				"Generic counter metric from v$asm_disk_iostat view in Oracle",
+				[]string{},
+				prometheus.Labels{"method": "hot_writes", "instname": instname, "dbname": dbname, "group_number": group_number_str, "disk_number": disk_number_str, "failgroup": failgroup}),
 			prometheus.CounterValue,
 			hot_writes,
 		)
 		ch <- prometheus.MustNewConstMetric(
-			prometheus.NewDesc(prometheus.BuildFQName("oracle", "asm", "count"), "Generic counter metric from v$asm_disk_iostat view in Oracle", []string{}, prometheus.Labels{"method": "reads", "instname": instname, "dbname": dbname, "group_number": group_number_str, "disk_number": disk_number_str, "failgroup": failgroup_str}),
+			prometheus.NewDesc(prometheus.BuildFQName("oracle", "asm", "count"),
+				"Generic counter metric from v$asm_disk_iostat view in Oracle",
+				[]string{},
+				prometheus.Labels{"method": "hot_bytes_read", "instname": instname, "dbname": dbname, "group_number": group_number_str, "disk_number": disk_number_str, "failgroup": failgroup}),
 			prometheus.CounterValue,
 			hot_bytes_read,
 		)
 		ch <- prometheus.MustNewConstMetric(
-			prometheus.NewDesc(prometheus.BuildFQName("oracle", "asm", "count"), "Generic counter metric from v$asm_disk_iostat view in Oracle", []string{}, prometheus.Labels{"method": "reads", "instname": instname, "dbname": dbname, "group_number": group_number_str, "disk_number": disk_number_str, "failgroup": failgroup_str}),
+			prometheus.NewDesc(prometheus.BuildFQName("oracle", "asm", "count"),
+				"Generic counter metric from v$asm_disk_iostat view in Oracle",
+				[]string{},
+				prometheus.Labels{"method": "hot_bytes_written", "instname": instname, "dbname": dbname, "group_number": group_number_str, "disk_number": disk_number_str, "failgroup": failgroup}),
 			prometheus.CounterValue,
 			hot_bytes_written,
 		)
 		ch <- prometheus.MustNewConstMetric(
-			prometheus.NewDesc(prometheus.BuildFQName("oracle", "asm", "count"), "Generic counter metric from v$asm_disk_iostat view in Oracle", []string{}, prometheus.Labels{"method": "reads", "instname": instname, "dbname": dbname, "group_number": group_number_str, "disk_number": disk_number_str, "failgroup": failgroup_str}),
+			prometheus.NewDesc(prometheus.BuildFQName("oracle", "asm", "count"),
+				"Generic counter metric from v$asm_disk_iostat view in Oracle",
+				[]string{},
+				prometheus.Labels{"method": "cold_reads", "instname": instname, "dbname": dbname, "group_number": group_number_str, "disk_number": disk_number_str, "failgroup": failgroup}),
 			prometheus.CounterValue,
 			cold_reads,
 		)
 		ch <- prometheus.MustNewConstMetric(
-			prometheus.NewDesc(prometheus.BuildFQName("oracle", "asm", "count"), "Generic counter metric from v$asm_disk_iostat view in Oracle", []string{}, prometheus.Labels{"method": "reads", "instname": instname, "dbname": dbname, "group_number": group_number_str, "disk_number": disk_number_str, "failgroup": failgroup_str}),
+			prometheus.NewDesc(prometheus.BuildFQName("oracle", "asm", "count"),
+				"Generic counter metric from v$asm_disk_iostat view in Oracle",
+				[]string{},
+				prometheus.Labels{"method": "cold_writes", "instname": instname, "dbname": dbname, "group_number": group_number_str, "disk_number": disk_number_str, "failgroup": failgroup}),
 			prometheus.CounterValue,
 			cold_writes,
 		)
 		ch <- prometheus.MustNewConstMetric(
-			prometheus.NewDesc(prometheus.BuildFQName("oracle", "asm", "count"), "Generic counter metric from v$asm_disk_iostat view in Oracle", []string{}, prometheus.Labels{"method": "reads", "instname": instname, "dbname": dbname, "group_number": group_number_str, "disk_number": disk_number_str, "failgroup": failgroup_str}),
+			prometheus.NewDesc(prometheus.BuildFQName("oracle", "asm", "count"),
+				"Generic counter metric from v$asm_disk_iostat view in Oracle",
+				[]string{},
+				prometheus.Labels{"method": "cold_bytes_read", "instname": instname, "dbname": dbname, "group_number": group_number_str, "disk_number": disk_number_str, "failgroup": failgroup}),
 			prometheus.CounterValue,
 			cold_bytes_read,
 		)
 		ch <- prometheus.MustNewConstMetric(
-			prometheus.NewDesc(prometheus.BuildFQName("oracle", "asm", "count"), "Generic counter metric from v$asm_disk_iostat view in Oracle", []string{}, prometheus.Labels{"method": "reads", "instname": instname, "dbname": dbname, "group_number": group_number_str, "disk_number": disk_number_str, "failgroup": failgroup_str}),
+			prometheus.NewDesc(prometheus.BuildFQName("oracle", "asm", "count"),
+				"Generic counter metric from v$asm_disk_iostat view in Oracle",
+				[]string{},
+				prometheus.Labels{"method": "cold_bytes_written", "instname": instname, "dbname": dbname, "group_number": group_number_str, "disk_number": disk_number_str, "failgroup": failgroup}),
 			prometheus.CounterValue,
 			cold_bytes_written,
 		)
