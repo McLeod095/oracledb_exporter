@@ -18,7 +18,7 @@ import (
 
 var (
 	// Version will be set at build time.
-	Version       = "0.0.0.dev"
+	Version       = "0.0.1.dev"
 	listenAddress = flag.String("web.listen-address", ":9161", "Address to listen on for web interface and telemetry.")
 	metricPath    = flag.String("web.telemetry-path", "/metrics", "Path under which to expose metrics.")
 	landingPage   = []byte("<html><head><title>Oracle DB exporter</title></head><body><h1>Oracle DB exporter</h1><p><a href='" + *metricPath + "'>Metrics</a></p></body></html>")
@@ -199,6 +199,24 @@ func (e *Exporter) scrape(ch chan<- prometheus.Metric) {
 
 	wg.Add(1)
 	go func() {
+		if err = ScrapeSessionsByUser(db, ch, "ACTIVE"); err != nil {
+			log.Errorln("Error scraping for sessions:", err)
+			e.scrapeErrors.WithLabelValues("sessions").Inc()
+		}
+		wg.Done()
+	}()
+
+	wg.Add(1)
+	go func() {
+		if err = ScrapeSessionsByUser(db, ch, "INACTIVE"); err != nil {
+			log.Errorln("Error scraping for sessions:", err)
+			e.scrapeErrors.WithLabelValues("sessions").Inc()
+		}
+		wg.Done()
+	}()
+
+	wg.Add(1)
+	go func() {
 		if err = ScrapeAQ(db, ch); err != nil {
 			log.Errorln("Error scraping for Oracle AQ:", err)
 			e.scrapeErrors.WithLabelValues("oracleaq").Inc()
@@ -214,6 +232,7 @@ func (e *Exporter) scrape(ch chan<- prometheus.Metric) {
 		}
 		wg.Done()
 	}()
+
 	wg.Wait()
 }
 
@@ -247,51 +266,68 @@ func ScrapeSessions(db *sql.DB, ch chan<- prometheus.Metric) error {
 		prometheus.GaugeValue,
 		inactiveCount,
 	)
+	return nil
+}
 
-	rows, err := db.Query("SELECT username, osuser, machine, state, count(*) FROM v$session WHERE status = 'ACTIVE' group_by username, osuser, machine, state")
+func ScrapeSessionsByUser(db *sql.DB, ch chan<- prometheus.Metric, status string) error {
+	rows, err := db.Query("SELECT username, osuser, machine, state, count(*) FROM v$session WHERE status = :1 group by username, osuser, machine, state", strings.ToUpper(status))
 	if err != nil {
 		return err
 	}
 	defer rows.Close()
 
 	for rows.Next() {
-		var username, osuser, machine, state string
-		var count float64
-		if err := rows.Scan(&username, &osuser, &machine, &state, &count); err != nil {
+		var db_username sql.NullString
+		var db_os_user sql.NullString
+		var db_machine sql.NullString
+		var db_state sql.NullString
+		var db_count sql.NullFloat64
+		if err := rows.Scan(&db_username, &db_os_user, &db_machine, &db_state, &db_count); err != nil {
 			return err
+		}
+
+		var username string
+		var os_user string
+		var machine string
+		var state string
+		var count float64
+
+		if db_username.Valid {
+			username = db_username.String
+		} else {
+			username = "_system_"
+		}
+
+		if db_os_user.Valid {
+			os_user = db_os_user.String
+		} else {
+			os_user = "_unknown_"
+		}
+
+		if db_machine.Valid {
+			machine = db_machine.String
+		} else {
+			machine = "_unknown_"
+		}
+
+		if db_state.Valid {
+			state = db_state.String
+		} else {
+			state = "_unknown"
+		}
+
+		if db_count.Valid {
+			count = db_count.Float64
 		}
 
 		ch <- prometheus.MustNewConstMetric(
 			prometheus.NewDesc(
-				prometheus.BuildFQName(namespace, "sessions", "active"),
-				"Gauge metric with count of sessions marked ACTIVE", []string{}, prometheus.Labels{"username": username, "osuser": osuser, "machine": machine, "state": state}),
-				prometheus.GaugeValue,
-				count,
-			)
-	}
-
-	rows, err = db.Query("SELECT username, osuser, machine, state, count(*) FROM v$session WHERE status = 'INACTIVE' group_by username, osuser, machine, state")
-	if err != nil {
-		return err
-	}
-	defer rows.Close()
-
-	for rows.Next() {
-		var username, osuser, machine, state string
-		var count float64
-		if err := rows.Scan(&username, &osuser, &machine, &state, &count); err != nil {
-			return err
-		}
-
-		ch <- prometheus.MustNewConstMetric(
-			prometheus.NewDesc(
-				prometheus.BuildFQName(namespace, "sessions", "inactive"),
-				"Gauge metric with count of sessions marked INACTIVE", []string{}, prometheus.Labels{"username": username, "osuser": osuser, "machine": machine, "state": state}),
+				prometheus.BuildFQName(namespace, "user", strings.ToLower(status)),
+				"Gauge metric with count of sessions by user marked "+strings.ToUpper(status), []string{}, prometheus.Labels{"username": username, "osuser": os_user, "machine": machine, "state": state}),
 			prometheus.GaugeValue,
 			count,
 		)
 	}
-
 	return nil
 }
 
