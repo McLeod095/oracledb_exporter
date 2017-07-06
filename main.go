@@ -248,6 +248,50 @@ func ScrapeSessions(db *sql.DB, ch chan<- prometheus.Metric) error {
 		inactiveCount,
 	)
 
+	rows, err := db.Query("SELECT username, osuser, machine, state, count(*) FROM v$session WHERE status = 'ACTIVE' group_by username, osuser, machine, state")
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var username, osuser, machine, state string
+		var count float64
+		if err := rows.Scan(&username, &osuser, &machine, &state, &count); err != nil {
+			return err
+		}
+
+		ch <- prometheus.MustNewConstMetric(
+			prometheus.NewDesc(
+				prometheus.BuildFQName(namespace, "sessions", "active"),
+				"Gauge metric with count of sessions marked ACTIVE", []string{}, prometheus.Labels{"username": username, "osuser": osuser, "machine": machine, "state": state}),
+				prometheus.GaugeValue,
+				count,
+			)
+	}
+
+	rows, err = db.Query("SELECT username, osuser, machine, state, count(*) FROM v$session WHERE status = 'INACTIVE' group_by username, osuser, machine, state")
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var username, osuser, machine, state string
+		var count float64
+		if err := rows.Scan(&username, &osuser, &machine, &state, &count); err != nil {
+			return err
+		}
+
+		ch <- prometheus.MustNewConstMetric(
+			prometheus.NewDesc(
+				prometheus.BuildFQName(namespace, "sessions", "inactive"),
+				"Gauge metric with count of sessions marked INACTIVE", []string{}, prometheus.Labels{"username": username, "osuser": osuser, "machine": machine, "state": state}),
+			prometheus.GaugeValue,
+			count,
+		)
+	}
+
 	return nil
 }
 
